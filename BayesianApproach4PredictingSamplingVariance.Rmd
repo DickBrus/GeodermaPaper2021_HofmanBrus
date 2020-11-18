@@ -1,0 +1,583 @@
+---
+title: Bayesian apporach for model-based prediction of sampling variance of estimated spatial mean
+author: "Dick J. Brus"
+date: "11/20/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+In this document sampling variances of the estimated mean N of agricultural fields are predicted using an estimated variogram for the fields. The evaluated sampling design is stratified simple random sampling, using copact geographical strata of equal area and one point per geostratum. Sample sizes are $5, 10, \cdots , 50$. The soil aliquots at the sampling locations are bulked into a composite sample. The uncertainty about the sampling variances of the estimated means, due to uncertainty about the variogram parameters and about the variances within the geostrata for a given variogram is quantified.
+
+R packages are loaded. 
+
+```{r}
+library(BayesianTools)
+library(sp)
+library(gstat)
+library(mvtnorm)
+library(spcosa)
+library(rgdal)
+library(ggplot2)
+```
+
+First several summary statistics of the sample data are computed per field.
+
+```{r}
+library(e1071)
+fields <- c(1,2,3,4,5,6,13,14,15,16,17,18,19,20,30,35)
+m <- cv <- skew <- numeric(length=length(fields))
+r <- 1
+for (f in fields) {
+  filename <- paste0("Perceel",f,".csv")
+  df <- read.csv(filename,header = FALSE)
+  names(df) <- c("Easting","Northing","N","logN")
+  m[r] <- mean(df$N)
+  cv[r] <- sqrt(var(df$N))/m[r]
+  skew[r] <- skewness(df$N)
+  r <- r+1
+}
+df <- data.frame(fields,m,cv,skew)
+ord <- order(df$cv)
+df[ord,]
+```
+
+
+## MCMC sampling
+
+The log likelihood function is defined, assuming a normal distribution of the data. The variance of the measurement error is added to the diagonal of the covariance matrix, so that the sampled variogram parameters are the variogram parameters of errorless measurements of N. This is needed because in the evaluated sampling design the soil samples are not analyzed separately. The soil samples are bulked into a composite sample, which is analyzed.
+
+```{r likelihood}
+ll <-function(thetas) {
+  sill <- 1/thetas[1]
+  nugget <- thetas[2]*sill
+  psill <- sill-nugget
+  C <- variogramLine(
+    vgm(model=model,psill=psill,range=thetas[3],nugget=nugget),dist_vector=D,covariance=TRUE)
+  diag(C) <- diag(C)+varlaberror
+  Cinv <- chol2inv(chol(C))
+  XC <- crossprod(X, Cinv)
+  XCz <- XC %*% z
+  XCX <- XC %*% X
+  betahat <- solve(XCX , XCz)
+  mu <- as.numeric(X%*%betahat)
+  logLik <- dmvnorm(x=z, mean=mu, sigma = C, log = T)
+  return(logLik)
+}
+```
+
+Initially, the variogram of N is estimated by maximum likelihood. An exponential variogram model is assumed. The ML estimates are used as initial values in MCMC sampling. In the Bayesian approach, I use a uniform prior for the inverse of the sill parameter, $\lambda=1/\sigma^2$, with a lower bound of 1e-6 and an upper bound of 1. For the distance parameter $\phi$ of the exponential variogram a uniform prior is assumed, with a lower bound of 1e-6 and an upper bound equal to three times the maximum distance in the dataset. For the relative nugget, $\tau^2/\sigma^2$, a uniform prior is assumed with a lower bound of 0 and an upper bound of 1.
+
+
+```{r MCMCsampling, eval=F, messages=FALSE, warning=FALSE}
+fields <- c(1,2,3,4,5,6,13,14,15,16,17,18,19,20,30,35)
+
+for (f in fields) {
+  filename <- paste0("Perceel",f,".csv")
+  df <- read.csv(filename,header = FALSE)
+  names(df) <- c("Easting","Northing","N","logN")
+
+  df$Easting  <- df$Easting - min(df$Easting)
+  df$Northing <- df$Northing - min(df$Northing)
+
+#compute variance of laborary measurement error (within lab)
+  varlaberror <- (df$N * 0.064)^2
+
+# compute matrix with Euclidian distances between sampling points
+  coordinates(df) <- ~Easting+Northing
+  D <- spDists(df)
+
+  lambda.ini <- 1/var(df$N) #initial value for inverse of sill variance sigmasq
+  tausqrel.ini <-  0.5 #initial value for tausq/sigmasq
+  phi.ini <- round(mean(D),0)
+  pars <- c(lambda.ini,tausqrel.ini,phi.ini)
+
+  df <- as(df,"data.frame")
+  X <- matrix(1 , nrow(df) , 1)
+  z <- df$N
+  model <- "Exp"
+  phimax <- round(3*max(D),0) 
+  vgML <- optim(pars, ll, control = list(fnscale = -1), 
+              method="L-BFGS-B", lower=c(1e-6,0,1e-6), upper=c(1,1,phimax))
+  lambda.ini <- vgML$par[1]
+  tausqrel.ini <- vgML$par[2]
+  phi.ini <- vgML$par[3]
+
+  priors <- createUniformPrior(lower=c(1e-6,0,1e-6), upper=c(1,1,phimax))
+  setup <- createBayesianSetup(likelihood=ll,prior=priors,
+                             best=c(lambda.ini,tausqrel.ini,phi.ini), 
+                             names=c("lambda","tausqrel","phi"))
+  set.seed(314)
+  DEzs.out <- runMCMC(setup,sampler="DEzs")
+
+  mcmcsam <- getSample(DEzs.out,start=1000,numSamples=1000)
+  mcmcsample <-data.frame(mcmcsam)
+  outputfilename <- paste0("MCMCsample",f,"_N",".csv")
+  write.csv(file=outputfilename,mcmcsample)
+}
+```
+
+Compute standard deviation, coeffcient of variation, P10, P50 and P90 of the estimated variogram parameters, and the correlation matrix.
+
+```{r}
+fields <- c(1,2,3,4,5,6,13,14,15,16,17,18,19,20,30,35)
+qnt.sill <- qnt.nugget <- qnt.range <- qnt.relnugget <- Cor <- matrix(nrow=length(fields),ncol=3)
+m.sill <- m.nugget <- m.relnugget <- m.range <-
+numeric(length=length(fields)) 
+sd.sill <- sd.nugget <- sd.relnugget <- sd.range <-
+numeric(length=length(fields)) 
+cv.sill <- cv.nugget <- cv.relnugget <- cv.range <- numeric(length=length(fields)) 
+r <- 1
+for (f in fields) {
+  filename <- paste0("MCMCsample",f,"_N.csv")
+  MCMCsample <- read.csv(file=filename,header=TRUE)
+  sill <- 1/MCMCsample$lambda
+  qnt.sill[r,] <- quantile(sill,c(0.1,0.5,0.9))
+  m.sill[r] <- mean(sill)
+  sd.sill[r] <- sqrt(var(sill))
+  cv.sill[r] <- sqrt(var(sill))/mean(sill)
+  relnugget <- MCMCsample$tausqrel
+  qnt.relnugget[r,] <- quantile(relnugget,c(0.1,0.5,0.9))
+  m.relnugget[r] <- mean(relnugget)
+  sd.relnugget[r] <- sqrt(var(relnugget))
+  cv.relnugget[r] <- sqrt(var(relnugget))/mean(relnugget)
+  nugget <- 1/MCMCsample$lambda*MCMCsample$tausqrel
+  qnt.nugget[r,] <- quantile(nugget,c(0.1,0.5,0.9))
+  m.nugget[r] <- mean(nugget)
+  sd.nugget[r] <- sqrt(var(nugget))
+  cv.nugget[r] <- sqrt(var(nugget))/mean(nugget)
+  range <- MCMCsample$phi
+  qnt.range[r,] <- quantile(range,c(0.1,0.5,0.9))
+  m.range[r] <- mean(range)
+  sd.range[r] <- sqrt(var(range))
+  cv.range[r] <- sqrt(var(range))/mean(range)
+  df <- data.frame(sill,nugget,phi=range)
+  corr <- cor(df)
+  Cor[r,] <- corr[lower.tri(corr)]
+  r <- r+1
+}
+(df <- data.frame(fields,m.relnugget,sd.relnugget,m.sill,sd.sill,m.range,sd.range))
+```
+
+
+For each field,the first 20 sampled variograms are plotted.
+
+```{r,  out.width='50%',fig.asp=.5, fig.show='hold'}
+fields <- c(1,2,3,4,5,6,13,14,15,16,17,18,19,20,30,35)
+
+for (f in fields) {
+  filename <- paste0("Perceel",f,".csv")
+  df <- read.csv(filename,header = FALSE)
+  names(df) <- c("Easting","Northing","N","logN")
+  df$Easting  <- df$Easting - min(df$Easting)
+  df$Northing <- df$Northing - min(df$Northing)
+  coordinates(df) <- ~Easting+Northing
+  D <- spDists(df)
+  maxD <- floor(3*max(D)/10)*10
+  d <- seq(from=1,to=maxD,by=1)
+
+  filename <- paste0("MCMCsample",f,"_N.csv")
+  MCMCsample <- read.csv(file=filename,header=TRUE)
+  semivar <- matrix(nrow=length(d),ncol=20)
+  for (i in 1:20) {
+    sill <- 1/MCMCsample$lambda[i]
+    nugget <- MCMCsample$tausqrel[i]*sill
+    psill <- sill-nugget
+    phi <- MCMCsample$phi[i]
+    g <- variogramLine(
+      vgm(model="Exp",psill=psill,range=phi,nugget=nugget),dist_vector=d)
+    semivar[,i] <- g$gamma
+  }
+  df <- data.frame(d=d,semivar)
+
+  filename <- paste0("Variograms_perceel",f,".pdf")
+  title <- paste0("Field ",f)
+  pdf(file = filename, width = 6, height = 4)
+  print(ggplot(df)+
+    geom_line(mapping=aes(x=d,y=X1))+
+    geom_line(mapping=aes(x=d,y=X2))+
+    geom_line(mapping=aes(x=d,y=X3))+
+    geom_line(mapping=aes(x=d,y=X4))+
+    geom_line(mapping=aes(x=d,y=X5))+
+    geom_line(mapping=aes(x=d,y=X6))+
+    geom_line(mapping=aes(x=d,y=X7))+
+    geom_line(mapping=aes(x=d,y=X8))+
+    geom_line(mapping=aes(x=d,y=X9))+
+    geom_line(mapping=aes(x=d,y=X10))+
+    geom_line(mapping=aes(x=d,y=X11))+
+    geom_line(mapping=aes(x=d,y=X12))+
+    geom_line(mapping=aes(x=d,y=X13))+
+    geom_line(mapping=aes(x=d,y=X14))+
+    geom_line(mapping=aes(x=d,y=X15))+
+    geom_line(mapping=aes(x=d,y=X16))+
+    geom_line(mapping=aes(x=d,y=X17))+
+    geom_line(mapping=aes(x=d,y=X18))+
+    geom_line(mapping=aes(x=d,y=X19))+
+    geom_line(mapping=aes(x=d,y=X20))+
+    scale_x_continuous(name = "Distance (m)",) +
+    scale_y_continuous(name = "Semivariance",limits=c(0,NA))+
+    ggtitle(title) +
+    theme(plot.title = element_text(hjust=0.5)))
+  dev.off()
+}
+```
+
+
+## Prediction of sampling variance
+
+The evaluated sampling design is stratified simple random sampling, using compact geographical strata of equal size and one point per stratum. Evaluated sample sizes are $5, 10, \cdots , 50$.
+
+As a first step for each field the geostrata are computed. The number of geostrata equals $L = 5, 10, \cdots , 50$.
+
+```{r geostratification, eval=F}
+nStrata <- c(5,10,15,20,25,30,35,40,45,50)
+
+# set number of nodes of discretisation grid
+Ngrd <- 2000
+set.seed(314)
+
+fields <- c(1,2,3,4,5,6,13,14,15,16,17,18,19,20,30,35)
+#fields <- c(16,17,30,35)
+
+for (f in fields) {
+  # read field of interest
+  filename <- paste0("perceel",f)
+  shpField <- readOGR(dsn = "shapefiles", layer = filename)
+  # remove projection attributes
+  proj4string(shpField) <- NA_character_
+  # construct discretisation grid
+  mygrid <- spsample(shpField,type="regular",n=Ngrd,offset=c(0.5,0.5))
+  gridded(mygrid) <- TRUE
+  for (L in nStrata) {
+    mygeostrata <- stratify(mygrid,nStrata = L, equalArea=TRUE, nTry=10)
+    mygeostrata<-as(mygeostrata, "data.frame")
+    filename <- paste0("Geostrata_perceel",f,"_",L,".RData")
+    save(mygeostrata, file=filename)
+  } 
+}
+```
+
+The next step is to simulate for each of the sampled variograms a large number of fields. This is done by Cholesky decomposition of the covariance matrix. Each simulated field is then used to compute the variance of the simulated values within the geostrata. These stratum variances are used to compute the sampling variance of the estimated mean:
+
+$$
+V_{\mathrm{STSI}}(\hat{\bar{z}}) = \frac{1}{L^2} \sum_{h=1}^L S^2_h(z)
+$$
+with $L$ total number of geostrata, and $S^2_h(z)$ the variance of the simlated values in stratum $h$.
+
+Besides for each variogram and each simulated field per variogram the poulation variance of the simulated values is computed. This population variance can be used to compute the sampling variance of the estimated eman for simple random sampling (no stratification). 
+
+For each sample size the mean and P90 of the $100 \times 100$ sampling variances are computed. 
+
+To get insight in the contribution of the two sources of randomness (MCMC sampling from posterior distribution of variogram parameters and geostatistical simulation of fields with a given variogram), the total variance of $100 \times 100$ sampling variances is decomposed as follows
+$$
+V_{\mathrm{total}}(V_{\mathrm{STSI}}) = V_{\mathrm{MCMC}}\left[E_{\xi}(V_{\mathrm{STSI}})\right] + E_{\mathrm{MCMC}}\left[V_{\xi}(V_{\mathrm{STSI}})\right] 
+$$
+The first variance component is the contribution due to uncertainty about the variogram, the second variance component is the contribution due to uncertainty about the variances of $z$ within the geostrata given a variogram.
+
+I used the first 100 of the about 1000 sampled variograms, and for each variogram I simulated 100 fields.
+
+For each field the following procedure is implemented:
+
+1. stratify the field into $L = 5, 10, \cdots , 50$ compact geostrata of equal size  
+2. sample 100 variograms from the multivariate posterior distribution of the variogram parameters by MCMC  
+3. simulate with the first sampled variogram 100 fields  
+4. compute for the first simulated field the variance within the geostrata, and compute the sampling variance of the estimated mean. This results in 10 sampling variances
+5. repeat step 4 for the other 99 fields. After this step we have 100 sampling variances for sample size $n = 5$, 100 sampling variances for $n = 10$, et cetera  
+6. repeat steps 3 - 5 for the other sampled variograms. After this step we have $100 \times 100$ sampling variances for $n = 5$, 100 sampling variances for $n = 10$, et cetera
+7. compute for each sample size the mean and P90 of the $100 \times 100$ sampling variances  
+8. compute the variance over the 100 sampled variograms of the average sampling variances (averaged over the 100 fields) for a given variogram. This is an estimate of the first variance component $V_{\mathrm{MCMC}}\left[E_{\xi}(V_{\mathrm{STSI}})\right]$  
+9. compute the average over the 100 sampled variograms of the variance of the sampling variance for a given variogram. This is an estimate of the second variance component $E_{\mathrm{MCMC}}\left[V_{\xi}(V_{\mathrm{STSI}})\right]$
+
+```{r simulatevariances, eval=F}
+# set number of MCMC samples to use
+nMCMC <- 100
+
+# set number of fields to be simulated
+nsim <- 100
+
+# start for-loop over all fields
+for (f in fields) {
+  #load fle with geostrata to extract discretisation grid
+  filename <- paste0("Geostrata_perceel",f,"_5",".RData")
+  load(file=filename)
+  mygrid <- mygeostrata[,c(2,3)]
+  coordinates(mygrid) <- ~x1+x2
+
+  # read MCMC sample of variogram parameters
+  filename <- paste0("MCMCsample",f,"_N.csv")
+  MCMCsample <- read.csv(file=filename,header=TRUE)
+
+  # array for storing the simulated variances of the estimated mean
+  V  <- array(dim=c(length(nStrata),nMCMC,nsim))
+  S2 <- matrix(nrow=nMCMC,ncol=nsim) #population variance
+  set.seed(314)
+  for (i in 1:nMCMC) {
+    D <- spDists(mygrid)
+    sill <- 1/MCMCsample$lambda[i]
+    range <- MCMCsample$phi[i]
+    nugget <- MCMCsample$tausqrel[i]*sill
+    psill <- sill - nugget
+    C <-  variogramLine(object=vgm(model="Exp",nugget=nugget,psill=psill,
+                                   range=range),
+                        dist_vector=D, covariance=TRUE)
+    # Cholesky decomposition of covariance matrix
+    Upper<-chol(C)
+    for (j in 1:nsim) {
+      # simulate random numbers from standard normal distribution
+      G<-rnorm(n=nrow(C),0,1)
+      zsim <- crossprod(Upper,G)
+      # compute variance for simple random sampling
+      S2[i,j] <- as.vector(var(zsim))
+      h <- 1
+      for (L in nStrata) {
+        filename <- paste0("Geostrata_perceel",f,"_",L,".RData")
+        load(file=filename)
+        S2h <- tapply(zsim,INDEX=as.factor(mygeostrata$stratumId),FUN=var)
+        V[h,i,j] <- 1/L^2*sum(S2h)
+        h <- h+1
+      }
+    }
+  }
+  filename <- paste0("Variances_perceel",f,".RData")
+  save(V,S2,file=filename)
+}
+```
+
+The mean, P50 and P90 of the $100 \times 100$ variances are computed as well as the two variance components.
+
+```{r}
+fields <- c(1,2,3,4,5,6,13,14,15,16,17,18,19,20,30,35)
+
+nStrata <- c(5,10,15,20,25,30,35,40,45,50)
+nMCMC <- 100
+nsim <- 100
+
+EmcmcExiV.STSI <- VmcmcExiV.STSI <- EmcmcVxiV.STSI <- P50V.STSI <- P90V.STSI <- matrix(nrow=length(fields),ncol=length(nStrata))
+r <- 1
+for (f in fields) {
+  filename <- paste0("Variances_perceel",f,".RData")
+  load(filename)
+
+  ExiV.STSI <- VxiV.STSI <- matrix(nrow=length(nStrata),ncol=nMCMC)
+  for (i in 1:length(nStrata)) {
+    V.L <- V[i,,]
+  # compute for each sampled variogram the mean and variance of the sampling variances over the nsim fields
+    ExiV.STSI[i,] <- apply(V.L,MARGIN=1,FUN=mean)
+    VxiV.STSI[i,] <- apply(V.L,MARGIN=1,FUN=var)
+    P50V.STSI[r,i] <- quantile(V.L,0.5)
+    P90V.STSI[r,i] <- quantile(V.L,0.9)
+  }
+  # compute average over all sampled variograms of conditional ExiV.STSI (conditional on variogram) 
+  EmcmcExiV.STSI[r,] <- apply(ExiV.STSI,MARGIN=1,FUN=mean)
+  # compute variance over all sampled variograms of conditional ExiV.STSI (conditional on variogram)
+  VmcmcExiV.STSI[r,] <- apply(ExiV.STSI,MARGIN=1,FUN=var)
+  # compute average over all sampled variograms of conditional VxiV.STSI (conditional on variogram)
+  EmcmcVxiV.STSI[r,] <- apply(VxiV.STSI,MARGIN=1,FUN=mean)
+  
+  r <- r+1
+}
+```
+
+Plot the predicted sampling variance against sample size (number of geostrata).
+
+```{r, out.width='50%',fig.asp=.5, fig.show='hold'}
+r <- 1
+for (f in fields) {
+  df <- data.frame(L=nStrata,mean=EmcmcExiV.STSI[r,],P50=P50V.STSI[r,],P90=P90V.STSI[r,])
+  filename <- paste0("SamplingVariance_perceel",f,".pdf")
+  title <- paste0("Field ",f)
+  pdf(file = filename, width = 6, height = 4)
+  print(ggplot(df)+
+    geom_point(mapping=aes(x=L,y=mean),size=2)+
+    geom_point(mapping=aes(x=L,y=P50),size=2,colour="red")+
+    geom_point(mapping=aes(x=L,y=P90),colour="green",size=2)+
+    scale_x_continuous(name = "Sample size",) +
+    scale_y_continuous(name = "Sampling variance",limits=c(0,NA))+
+    ggtitle(title) +
+    theme(plot.title = element_text(hjust=0.5)))
+  dev.off()
+  r <- r+1
+}
+```
+
+Plot the two components of the variance of the sampling variance (over repeated MCMC sampling and repeated simulation of fields) against the sample size.
+
+```{r, out.width='50%',fig.asp=.5, fig.show='hold'}
+r <- 1
+for (f in fields) {
+  df <- data.frame(L=nStrata,VmcmcExi=VmcmcExiV.STSI[r,],EmcmcVxi=EmcmcVxiV.STSI[r,])
+  filename <- paste0("VarianceComponents_perceel",f,".pdf")
+  title <- paste0("Field ",f)
+  pdf(file = filename, width = 6, height = 4)
+  print(ggplot(df)+
+    geom_point(mapping=aes(x=L,y=VmcmcExi),colour="red")+
+    geom_point(mapping=aes(x=L,y=EmcmcVxi))+
+    scale_x_continuous(name = "Sample size",) +
+    scale_y_continuous(name = "Variance component",limits=c(0,NA))+
+    ggtitle(title) +
+    theme(plot.title = element_text(hjust=0.5)))
+  dev.off()
+  r <- r+1
+}
+```
+
+These figures show that the contribution of the uncertainty about the variogram parameters (red dots in figures, VmcmcExi) is much larger than the contribution due to uncertainty about the stratum variances given a variogram. For all agricultural fields, the second variance component is negligible for sample sizes of 10 and larger.
+
+Compute the mean, P50 and P90 of the sampling variance for simple random sampling
+
+```{r}
+r <- 1
+EmcmcExiV.SI <- P50V.SI <- P90V.SI <- matrix(nrow=length(fields),ncol=length(nStrata))
+r <- 1
+for (f in fields) {
+  filename <- paste0("Variances_perceel",f,".RData")
+  load(filename)
+  for (i in 1:length(nStrata)) {
+    n <- matrix(data=nStrata[i],nrow=nrow(S2),ncol=ncol(S2))
+    V.SI <- S2/n
+    EmcmcExiV.SI[r,i] <- mean(V.SI)
+    P50V.SI[r,i] <- quantile(V.SI,0.5)
+    P90V.SI[r,i] <- quantile(V.SI,0.9)
+  }
+  r <- r+1
+}
+```
+
+Make plot of stratification effect based on the median, as a function of the sample size
+
+```{r, out.width='50%',fig.asp=.5, fig.show='hold'}
+strateff = t(P50V.SI/P50V.STSI)
+save(strateff,file="StratificationEffecet_normal.RData")
+df <- data.frame(n=nStrata,strateff)
+pdf(file = "Stratificationeffect.pdf", width = 6, height = 4)
+ggplot(df)+
+  geom_line(mapping=aes(x=nStrata,y=X1))+
+  geom_line(mapping=aes(x=nStrata,y=X2))+
+  geom_line(mapping=aes(x=nStrata,y=X3))+
+  geom_line(mapping=aes(x=nStrata,y=X4))+
+  geom_line(mapping=aes(x=nStrata,y=X5))+
+  geom_line(mapping=aes(x=nStrata,y=X6))+
+  geom_line(mapping=aes(x=nStrata,y=X6))+
+  geom_line(mapping=aes(x=nStrata,y=X7))+
+  geom_line(mapping=aes(x=nStrata,y=X8))+
+  geom_line(mapping=aes(x=nStrata,y=X9))+
+  geom_line(mapping=aes(x=nStrata,y=X10))+
+  geom_line(mapping=aes(x=nStrata,y=X11))+
+  geom_line(mapping=aes(x=nStrata,y=X12))+
+  geom_line(mapping=aes(x=nStrata,y=X13))+
+  geom_line(mapping=aes(x=nStrata,y=X14))+
+  geom_line(mapping=aes(x=nStrata,y=X15))+
+  geom_line(mapping=aes(x=nStrata,y=X16))+
+  scale_x_continuous(name = "Sample size",) +
+  scale_y_continuous(name = "Stratification effect",limits=c(1,NA))
+dev.off()
+
+```
+
+
+Make plots of P50 and P90 of variance for SI and STSI.
+
+```{r, out.width='50%',fig.asp=.5, fig.show='hold'}
+r <- 1
+for (f in fields) {
+  df <- data.frame(L=nStrata,
+#                   meanSTSI=EmcmcExiV.STSI[r,],
+#                   meanSI=EmcmcExiV.SI[r,], 
+                   P50STSI=P50V.STSI[r,],
+                   P50SI=P50V.SI[r,],
+                   P90STSI=P90V.STSI[r,],
+                   P90SI=P90V.SI[r,])
+  filename <- paste0("VSI_perceel",f,".pdf")
+  title <- paste0("Field ",f)
+  pdf(file = filename, width = 6, height = 4)
+  print(ggplot(df)+
+    geom_point(mapping=aes(x=L,y=P50STSI))+
+    geom_point(mapping=aes(x=L,y=P50SI),colour="red")+
+    geom_point(mapping=aes(x=L,y=P90STSI),shape=2)+
+    geom_point(mapping=aes(x=L,y=P90SI),colour="red",shape=2)+
+    scale_x_continuous(name = "Sample size",) +
+    scale_y_continuous(name = "Sampling variance",limits=c(0,NA))+
+    ggtitle(title) +
+    theme(plot.title = element_text(hjust=0.5)))
+  dev.off()
+  r <- r+1
+}
+```
+
+Compute relative expanded measurement uncertainty, defined as:
+
+$$
+U = 100 \frac{2\sqrt{V_{\mathrm{STSI}}(\hat{\bar{z}})+V_{\mathrm{lab}}}}{\bar{z}}
+$$
+$U$ is computed using the mean of the sampling variances, as well as with the P90 of the sampling variances.
+
+```{r}
+r <- 1
+U <- U.P50 <- U.P90 <- matrix(nrow=length(fields),ncol=length(nStrata))
+for (f in fields){
+  filename <- paste0("Perceel",f,".csv")
+  df <- read.csv(filename,header = FALSE)
+  names(df) <- c("Easting","Northing","N","logN")
+  meanz <- mean(df$N)
+  varlaberror <- (meanz * 0.064)^2
+  sdtot <- sqrt(EmcmcExiV.STSI[r,] + varlaberror)
+  U[r,] <- (2*sdtot/meanz)*100
+  sdtot <- sqrt(P50V.STSI[r,] + varlaberror)
+  U.P50[r,] <- (2*sdtot/meanz)*100
+  sdtot <- sqrt(P90V.STSI[r,] + varlaberror)
+  U.P90[r,] <- (2*sdtot/meanz)*100
+  r <- r+1
+}
+```
+
+Plot $U$ against sample size.
+
+```{r, out.width='50%',fig.asp=.5, fig.show='hold'}
+r <- 1
+for (f in fields) {
+  df <- data.frame(L=nStrata,U = U[r,], P50U = U.P50[r,], P90U = U.P90[r,])
+  filename <- paste0("U_perceel",f,".pdf")
+  title <- paste0("Field ",f)
+  pdf(file = filename, width = 6, height = 4)
+  print(ggplot(df)+
+#    geom_point(mapping=aes(x=L,y=U))+
+    geom_point(mapping=aes(x=L,y=P50U),colour="red")+
+    geom_point(mapping=aes(x=L,y=P90U),colour="green")+
+    scale_x_continuous(name = "Sample size") +
+    scale_y_continuous(name = "U%",limits=c(0,50))+
+    theme(legend.position = "none")+ 
+    ggtitle(title) +
+    theme(plot.title = element_text(hjust=0.5)))
+  dev.off()
+  r <- r+1
+}
+```
+
+Required sample sizes are computed for a threshold of 50\% for $U$.
+
+```{r}
+r <- 1
+nreq <- nreqP50 <- nreqP90 <- numeric(length=length(fields))
+for (f in fields){
+  nreq[r] <- ceiling(approx(x=U[r,],y=nStrata,xout=50,yleft=51,yright=4)$y)
+  nreqP50[r] <- ceiling(approx(x=U.P50[r,],y=nStrata,xout=50,yleft=51,yright=4)$y)
+  nreqP90[r] <- ceiling(approx(x=U.P90[r,],y=nStrata,xout=50,yleft=51,yright=4)$y)
+  r <- r+1
+}
+
+df <- data.frame(field=fields,nreq=nreq,nreqP50=nreqP50,nreqP90=nreqP90)
+df$nreq <- as.character(df$nreq)
+df$nreqP50 <- as.character(df$nreqP50)
+df$nreqP90 <- as.character(df$nreqP90)
+df$nreq[df$nreq==4] <- "<5"
+df$nreq[df$nreq==51] <- ">50"
+df$nreqP50[df$nreqP50==4] <- "<5"
+df$nreqP50[df$nreqP50==51] <- ">50"
+df$nreqP90[df$nreqP90==4] <- "<5"
+df$nreqP90[df$nreqP90==51] <- ">50"
+(df)
+```
