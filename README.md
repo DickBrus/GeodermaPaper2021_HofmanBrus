@@ -1,2 +1,2 @@
-# SpatialSamplingwithR
-This repository contains an Rmarkdown (Rmd) file and the nitrogen-N data of agricultural fields used in the paper S. C. K.  Hofman and D.J. Brus How many sampling points are needed to estimate the mean nitrate-N content of agricultural fields? A geostatistical simulation approach with uncertain variograms, published in Geoderma (in press).
+# How many observations are needed for a nitrate-N survey of agricultural fields?
+This repository contains an Rmarkdown (Rmd) file and the nitrogen-N data of agricultural fields used in the paper S. C. K.  Hofman and D.J. Brus (2021) How many sampling points are needed to estimate the mean nitrate-N content of agricultural fields? A geostatistical simulation approach with uncertain variograms, published in Geoderma, volume 385. (10.1016/j.geoderma.2020.114816).
